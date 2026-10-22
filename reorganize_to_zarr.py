@@ -121,6 +121,99 @@ Usage
     python reorganize_to_zarr.py --out out.zarr --vars 2T WS10 \\
         --rad-var SSRD_GDS0_SFC
 
+Adding variables to a store that already exists
+-----------------------------------------------
+Never re-run a build with the same --out to add variables: a build
+creates the output from scratch and overwrites it. Use --append, which
+leaves everything already in the store untouched.
+
+The newer families (STL1, SD, SKT, WCT) arrive as tarballs. Extract each
+family into its own directory under the source root; the members are
+already laid out as <MM>/<file>, so no further path handling is needed:
+
+    cd /qumulo/azcot
+    for fam in STL1 sd skt wct; do
+      mkdir -p "$fam"
+      for t in archive/*"$fam".tar.gz archive/*"$fam".tgz; do
+        [ -e "$t" ] && tar -xzf "$t" -C "$fam"
+      done
+    done
+
+(GNU tar keeps everything inside the target directory: it strips a
+leading "/" from absolute member names and skips members containing
+"..", exiting non-zero if it skipped any - so a tarball with such names
+fails loudly instead of writing elsewhere. Only the climatology
+families need extracting: the 2t, wind and rad tarballs are
+mostly raw per-year files, a different product that does not belong on
+this placeholder-year time axis, and their climatology is already in
+the store.)
+
+    # what would go in, and which months each source lacks:
+    python reorganize_to_zarr.py --list-vars --vars STL1 SD SKT WCT
+
+    # add them:
+    python reorganize_to_zarr.py --out /qumulo/azcot/azcot.zarr --append \\
+        --vars STL1 SD SKT WCT --max-workers 4
+
+    # record units once established (writes no data):
+    python reorganize_to_zarr.py --out /qumulo/azcot/azcot.zarr --annotate \\
+        --meta WCT.units=degF
+
+HDF5-format source files (NetCDF-4) are read under a process-wide lock,
+because opening them from several threads at once through the netCDF4
+engine corrupts memory (a segfault or "free(): invalid size" partway
+through a long run). Classic NetCDF-3 files are unaffected and stay
+parallel, so --max-workers speeds up those but not HDF5 ones. To see
+which kind a file is:
+
+    python3 -c "print(open('/qumulo/azcot/wct/01/010100.91-20wctclim.nc','rb').read(8))"
+    # b'\\x89HDF\\r\\n\\x1a\\n' = HDF5 / NetCDF-4     b'CDF\\x01' or b'CDF\\x02' = classic
+
+If a run is interrupted (crash, Ctrl-C, lost mount):
+
+  * Adding NEW variables: the store is unaffected. They are registered
+    only once all have been written, so what was written is an invisible
+    leftover. Re-run the same command: leftovers of the variables being
+    added are deleted and rewritten. Add --resume to keep the ones that
+    finished completely and redo only the unfinished one.
+  * --replace: the variable is un-registered BEFORE its data is deleted,
+    so an interruption leaves it absent from the store (never listed but
+    half destroyed, which an earlier version allowed). Re-run to restore
+    it. It is unavailable to readers while it is being rewritten.
+  * --fill: nothing is ever deleted, so the array is valid at every
+    moment; re-run to finish.
+
+Months that arrive after a variable was added
+---------------------------------------------
+Extract the new tarball(s) into the family's directory, then --fill. It
+writes only the months whose source files now exist and that the array's
+months_with_data does not list, in place, without deleting anything:
+
+    tar -xzf archive/novSTL1.tar.gz -C /qumulo/azcot/STL1
+    python reorganize_to_zarr.py --out /qumulo/azcot/azcot.zarr --fill \\
+        --vars STL1 SD SKT --max-workers 4
+
+Run it BEFORE verify_zarr.py: until then the store holds NaN where source
+files now exist, and the verifier will (correctly) report that as a
+mismatch. Each month is checked against what the array already holds
+first: the files' units must equal the recorded source_units and the grid
+must equal the group's, or the month is refused and nothing is written. A
+month that already has data is refused too (use --replace to refresh).
+Arrays built before months_with_data existed (the original 2T, WS10 and
+SSRD) need --months to say which months are empty.
+
+Prefer --fill to --replace for this: it reads only the new months, and
+cannot leave a variable missing.
+
+Append refuses, and changes nothing, if: a variable is already present
+(use --replace NAME to overwrite deliberately); the source has a month
+the store's time axis lacks; or the store is not one this tool made. A
+month the store has but the source lacks is left NaN and recorded in the
+array's months_with_data attribute. A variable on a grid no existing
+group matches gets a new group; one with the same spacing but a
+different shape gets a disambiguated name (e.g. grid_0p25_121x720)
+rather than reusing or overwriting the existing group.
+
 Clients read the finished store however they like (local path or, if
 you serve it, a URL) and need none of the per-file scaffolding:
 
@@ -141,11 +234,13 @@ below) and enforces the 2.18 floor at import.
 """
 
 import argparse
+import collections
 import concurrent.futures as cf
 import contextlib
 import datetime as dt
 import os
 import re
+import threading
 
 import numpy as np
 import pandas as pd
@@ -295,6 +390,36 @@ def _p_ws10(mm, dd, hh):
     return f"windclimo/{mm:02d}/{dd:02d}/{mm:02d}{dd:02d}{hh:02d}.WS10.nc"
 
 
+# The four families below arrive as tarballs whose members sit directly in
+# a month directory ("01/STL1.jan1414.91-20clim.nc"), so extracting each
+# family's tarballs with `tar -C <root>/<family>` yields exactly these
+# paths. Names carry <DD><HH> (e.g. jan1414 = day 14, hour 14), the same
+# convention as 2T; a wrong guess would show up as missing hours.
+
+def _p_stl1(mm, dd, hh):
+    return (f"STL1/{mm:02d}/"
+            f"STL1.{MONTH_ABBR[mm-1]}{dd:02d}{hh:02d}.91-20clim.nc")
+
+
+def _p_sd(mm, dd, hh):
+    return f"sd/{mm:02d}/SD.{MONTH_ABBR[mm-1]}{dd:02d}{hh:02d}.91-20clim.nc"
+
+
+def _p_skt(mm, dd, hh):
+    return f"skt/{mm:02d}/SKT.{MONTH_ABBR[mm-1]}{dd:02d}{hh:02d}.91-20clim.nc"
+
+
+def _p_wct(mm, dd, hh):
+    # Same shape as rad: <MM><DD><HH> in the name, flat in the month dir.
+    return f"wct/{mm:02d}/{mm:02d}{dd:02d}{hh:02d}.91-20wctclim.nc"
+
+
+# Variables a plain build includes when --vars is not given. The newer
+# families are opt-in (--vars STL1 ...), so an old command line keeps
+# meaning what it always meant.
+CORE_VARS = ("2T", "SSRD", "WS10")
+
+
 def build_specs(rad_var=None):
     return {
         "2T": VarSpec(
@@ -304,13 +429,31 @@ def build_specs(rad_var=None):
             "SSRD", "rad", _p_rad, src_var=rad_var,
             prefer=RAD_VAR_PREFERENCE,
             long_name="surface solar irradiance",
-            note=("rad files hold ~6 variables; name auto-detected or set "
-                  "via --rad-var. Check units: accumulated J m-2 needs "
-                  "/3600 for W m-2.")),
+            note=("Source variable is accumulated energy (units "
+                  "'W m**-2 s' = J m-2 per accumulation period); divide by "
+                  "the period in seconds for average W m-2. Land-masked in "
+                  "the source archive.")),
         "WS10": VarSpec(
             "WS10", "windclimo", _p_ws10, src_var=None,
             units="m s-1", long_name="10 metre wind speed",
             note="WS10 is precomputed speed; no u/v combination needed"),
+        "STL1": VarSpec(
+            "STL1", "STL1", _p_stl1, src_var=None,
+            note=("Source variable is named STL1_GDS0_DBLY. Months not "
+                  "delivered in the archive are NaN; see months_with_data.")),
+        "SD": VarSpec(
+            "SD", "sd", _p_sd, src_var=None,
+            note=("Months not delivered in the archive are NaN; see "
+                  "months_with_data.")),
+        "SKT": VarSpec(
+            "SKT", "skt", _p_skt, src_var=None,
+            note=("Months not delivered in the archive are NaN; see "
+                  "months_with_data.")),
+        "WCT": VarSpec(
+            "WCT", "wct", _p_wct, src_var=None,
+            note=("The source files carry NO units and NO long_name, so "
+                  "neither is known from the data. Verify the units "
+                  "(check_wct_units.py) before relying on them.")),
     }
 
 
@@ -359,23 +502,51 @@ def make_fs(root):
     return None
 
 
+# NetCDF-4 / HDF5 files must not be opened and read from several threads
+# at once through the netCDF4 engine. xarray serialises the *reads* but
+# gives every file its own lock for the *open*, and netCDF-C / HDF5 keep
+# process-global state that is not safe under concurrent opens. The
+# result is not an error but heap corruption: a segfault or
+# "free(): invalid size", partway through a long run. Reproduced with
+# files written as NetCDF-4 (a real WCT delivery was the trigger); classic
+# (NetCDF-3) files, which never touch HDF5, survived the same load.
+# So HDF5-format files take this lock for the whole open+read, while
+# classic files stay fully parallel exactly as before.
+_HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+_HDF5_LOCK = threading.RLock()
+
+
+def _is_hdf5_path(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(8) == _HDF5_MAGIC
+    except OSError:
+        return False
+
+
 @contextlib.contextmanager
 def open_source(root, fs, spec, ts):
     """
     Open one hourly source file as an xarray Dataset, regardless of
-    whether root is a local path or an http(s) URL.
+    whether root is a local path or an http(s) URL. HDF5-format files are
+    opened under a process-wide lock (see _HDF5_LOCK).
     """
     relpath = spec.path(ts.month, ts.day, ts.hour)
     if fs is not None:
         f = fs.open(f"{root}/{relpath}", mode="rb")
         try:
-            with xr.open_dataset(f) as ds:
-                yield ds
+            hdf5 = f.read(8) == _HDF5_MAGIC
+            f.seek(0)
+            with (_HDF5_LOCK if hdf5 else contextlib.nullcontext()):
+                with xr.open_dataset(f) as ds:
+                    yield ds
         finally:
             f.close()
     else:
-        with xr.open_dataset(os.path.join(root, relpath)) as ds:
-            yield ds
+        path = os.path.join(root, relpath)
+        with (_HDF5_LOCK if _is_hdf5_path(path) else contextlib.nullcontext()):
+            with xr.open_dataset(path) as ds:
+                yield ds
 
 
 def _days_in_month(month, year=PLACEHOLDER_YEAR):
@@ -507,43 +678,188 @@ def _fetch(root, fs, spec, src_var, ts):
         return None
 
 
-def convert(out_path, var_names=None, rad_var=None, chunks=DEFAULT_CHUNKS,
-            max_workers=16, clevel=5, quantize_digits=None, zarr_format=2,
-            deaccumulate=True, verbose=True):
-    """
-    Build one Zarr store containing every requested variable.
+def _resolve_source_var(root, fs, spec, sample_ts):
+    """(variable name, units, long_name) read from one real source file."""
+    with open_source(root, fs, spec, sample_ts) as ds:
+        latn, lonn = find_coord_names(ds)
+        sv = pick_variable(ds, spec, latn, lonn)
+        return sv, ds[sv].attrs.get("units"), ds[sv].attrs.get("long_name")
 
-    All variables must share a grid to live in one store. If the
-    archives disagree this stops with a clear message rather than
-    silently regridding - resampling climatology fields is a scientific
-    decision, not a plumbing one.
 
-    deaccumulate : if True (default), a variable whose name carries an
-        ECMWF-style accumulation tag ("..._acc1h") AND whose units are
-        dimensionally energy (J m-2, or the confusing-but-real
-        "W m**-2 s" = J m-2) is divided by the accumulation period in
-        seconds, converting it to an average flux in W m-2. Confirmed
-        needed for the real rad/SSRD archive: its variable is literally
-        named "SSRD_GDS0_SFC_acc1h" with units "W m**-2 s" - i.e. it is
-        accumulated energy, not instantaneous irradiance, despite the
-        "W" in the units string. Left unconverted, values are 3600x
-        too large for a 1h accumulation and would not look obviously
-        wrong. Set False to store the raw accumulated values as-is.
+def _grid_group_name(lats):
+    """Self-describing group label from grid spacing, e.g. 'grid_0p25'."""
+    return "grid_" + f"{abs(float(lats[1] - lats[0])):.2f}".replace(".", "p")
+
+
+def _time_values(times):
+    return ((times - pd.Timestamp(f"{PLACEHOLDER_YEAR}-01-01"))
+            // pd.Timedelta("1h")).values.astype("int64")
+
+
+def _write_group_coords(grp, lats, lons, tvals, chunks):
+    """lat / lon / time coordinate arrays for one grid group."""
+    nla, nlo, nt = len(lats), len(lons), len(tvals)
+    ct, cla, clo = chunks
+
+    # fill_value=None on coords is essential: zarr v2 defaults it to 0
+    # and xarray then reads 0 as missing - which would silently NaN out
+    # lon=0.0 (the prime meridian IS on this grid) and time index 0.
+    zlat = _make_array(grp, "lat", (nla,), (nla,), "float32", fill_value=None)
+    zlat[:] = lats
+    zlat.attrs["_ARRAY_DIMENSIONS"] = ["lat"]
+    zlat.attrs["units"] = "degrees_north"
+
+    zlon = _make_array(grp, "lon", (nlo,), (nlo,), "float32", fill_value=None)
+    zlon[:] = lons
+    zlon.attrs["_ARRAY_DIMENSIONS"] = ["lon"]
+    zlon.attrs["units"] = "degrees_east"
+
+    ztime = _make_array(grp, "time", (nt,), (nt,), "int64", fill_value=None)
+    ztime[:] = tvals
+    ztime.attrs["_ARRAY_DIMENSIONS"] = ["time"]
+    ztime.attrs["units"] = f"hours since {PLACEHOLDER_YEAR}-01-01 00:00:00"
+    ztime.attrs["calendar"] = "standard"
+    grp.attrs["chunking_rationale"] = (
+        f"chunked ({ct},{cla},{clo}) so a point timeseries costs "
+        f"{int(np.ceil(nt/ct))} request(s) instead of {nt}")
+
+
+def _apply_meta(arr, attrs):
     """
+    Set operator-supplied attributes. Supplying units records who said so
+    (units_source) and clears the "units unknown" note - unless the
+    operator supplied units_source themselves, which then wins regardless
+    of argument order (e.g. "inferred from data, not confirmed").
+    """
+    attrs = dict(attrs or {})
+    for k, v in attrs.items():
+        arr.attrs[k] = v
+    if "units" in attrs:
+        if "units_source" not in attrs:
+            arr.attrs["units_source"] = "supplied by the operator (--meta)"
+        if "units_note" in arr.attrs:
+            del arr.attrs["units_note"]
+
+
+def _define_array(grp, nm, spec, root, sv, src_units, src_long, shape, chunks,
+                  compressor, deaccumulate, meta, verbose):
+    """
+    Create one data array with its full attribute set. Shared by build
+    and append so the two can never disagree about what a variable's
+    metadata looks like. Returns (array, deaccumulation_seconds_or_None).
+    """
+    deaccum_seconds = (infer_deaccum_seconds(sv, src_units)
+                       if deaccumulate else None)
+    out_units = spec.units or src_units or ""
+    if deaccum_seconds:
+        out_units = "W m-2"
+        if verbose:
+            print(f"  {nm} <- '{sv}' (units: {src_units}) "
+                  f"** ACCUMULATED FLUX DETECTED: dividing by "
+                  f"{deaccum_seconds}s -> stored as W m-2 **")
+    elif verbose:
+        print(f"  {nm} <- '{sv}' (units: {src_units})")
+
+    nt, nla, nlo = shape
+    a = _make_array(grp, nm, shape, chunks, "float32",
+                    compressor=compressor, fill_value=np.nan)
+    a.attrs["_ARRAY_DIMENSIONS"] = ["time", "lat", "lon"]
+    a.attrs["units"] = out_units
+    a.attrs["long_name"] = spec.long_name or src_long or nm
+    a.attrs["source_variable"] = sv
+    a.attrs["source_units"] = src_units or ""
+    # A local root is recorded as an absolute path: a relative one is
+    # meaningless in a store's metadata once you are in another directory.
+    a.attrs["source_layout"] = (
+        f"{root if is_url(root) else os.path.abspath(root)}/"
+        f"{spec.path(1, 1, 0)}")
+    a.attrs["grid"] = f"{nla}x{nlo}"
+    # Record the *option*, not just the outcome, so a verifier can tell
+    # "deliberately left raw" from "should have been converted but wasn't".
+    a.attrs["deaccumulate_option"] = bool(deaccumulate)
+    if deaccum_seconds:
+        a.attrs["deaccumulated"] = True
+        a.attrs["deaccumulation_seconds"] = deaccum_seconds
+        a.attrs["note"] = (
+            (spec.note + " " if spec.note else "") +
+            f"Converted from accumulated '{src_units}' to average "
+            f"W m-2 by dividing by {deaccum_seconds}s. Set "
+            f"deaccumulate=False to store raw accumulated values.")
+    elif spec.note:
+        a.attrs["note"] = spec.note
+
+    # A variable whose files declare no units must not look like it has
+    # them: record the gap rather than leaving a bare empty string.
+    if not out_units:
+        a.attrs["units_note"] = ("source files carry no units attribute; "
+                                 "units are unknown")
+    _apply_meta(a, meta)
+    return a, deaccum_seconds
+
+
+def _fill_array(arr, root, fs, spec, sv, times, deaccum_seconds,
+                quantize_digits, max_workers, verbose=True, label=""):
+    """
+    Read every hour for one variable and write it, one time-chunk at a
+    time (so peak memory is one chunk of the full grid). Missing hours
+    stay NaN. Returns {"missing": n, "months_with_data": [...]}.
+    """
+    nt = len(times)
+    nla, nlo = arr.shape[1], arr.shape[2]
+    step = arr.chunks[0]
+    got = collections.Counter()
+    missing = 0
+    for start in range(0, nt, step):
+        stop = min(start + step, nt)
+        block = times[start:stop]
+        buf = np.full((stop - start, nla, nlo), np.nan, dtype="float32")
+        with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(_fetch, root, fs, spec, sv, ts): i
+                    for i, ts in enumerate(block)}
+            for fut in cf.as_completed(futs):
+                i = futs[fut]
+                field = fut.result()
+                if field is None:
+                    missing += 1
+                else:
+                    buf[i] = field
+                    got[int(block[i].month)] += 1
+        if deaccum_seconds:
+            buf = buf / deaccum_seconds
+        if quantize_digits is not None:
+            buf = np.round(buf, quantize_digits)
+        arr[start:stop, :, :] = buf
+        if verbose:
+            print(f"  {label or spec.name}: wrote {stop}/{nt} timesteps "
+                  f"({100*stop/nt:.0f}%)")
+    return {"missing": missing, "months_with_data": sorted(got)}
+
+
+def _record_coverage(arr, nt, stats):
+    """Store which months actually have data, so gaps are visible later."""
+    arr.attrs["months_with_data"] = [int(m) for m in stats["months_with_data"]]
+    arr.attrs["missing_hours"] = int(stats["missing"])
+    arr.attrs["expected_hours"] = int(nt)
+
+
 def convert(out_path, var_names=None, rad_var=None, root=DEFAULT_ROOT,
             chunks=DEFAULT_CHUNKS, max_workers=16, clevel=5,
             quantize_digits=None, zarr_format=2, deaccumulate=True,
-            verbose=True):
+            meta=None, verbose=True):
     """
     Build one Zarr store containing every requested variable.
 
     root : local filesystem path (default: the Qumulo mount at
         /qumulo/azcot) or an http(s) URL - auto-detected.
 
-    All variables must share a grid to live in one store. If the
-    archives disagree this stops with a clear message rather than
-    silently regridding - resampling climatology fields is a scientific
-    decision, not a plumbing one.
+    var_names : defaults to CORE_VARS (2T, SSRD, WS10). The newer
+        families (STL1, SD, SKT, WCT) are opt-in. To add them to a store
+        that already exists, use append() instead - this function
+        creates the output from scratch and overwrites what is there.
+
+    All variables on one grid share a group; differing grids get their
+    own group and are never regridded (resampling climatology fields is
+    a scientific decision, not a plumbing one).
 
     deaccumulate : if True (default), a variable whose name carries an
         ECMWF-style accumulation tag ("..._acc1h") AND whose units are
@@ -556,9 +872,13 @@ def convert(out_path, var_names=None, rad_var=None, root=DEFAULT_ROOT,
         "W" in the units string. Left unconverted, values are 3600x
         too large for a 1h accumulation and would not look obviously
         wrong. Set False to store the raw accumulated values as-is.
+
+    meta : {variable: {attr: value}} overrides applied to array
+        attributes, e.g. {"WCT": {"units": "degF"}}.
     """
     specs = build_specs(rad_var)
-    var_names = list(var_names) if var_names else list(specs)
+    var_names = list(var_names) if var_names else list(CORE_VARS)
+    meta = meta or {}
     fs = make_fs(root)
 
     if verbose:
@@ -596,10 +916,7 @@ def convert(out_path, var_names=None, rad_var=None, root=DEFAULT_ROOT,
                  for nm in var_names}
 
     def group_name(nlat, nlon):
-        """Self-describing group label, e.g. 'grid_0p25'."""
-        lats_ = info_lats[(nlat, nlon)]
-        dlat = abs(float(lats_[1] - lats_[0]))
-        return "grid_" + f"{dlat:.2f}".replace(".", "p")
+        return _grid_group_name(info_lats[(nlat, nlon)])
 
     single_grid = len(grids) == 1
 
@@ -623,8 +940,7 @@ def convert(out_path, var_names=None, rad_var=None, root=DEFAULT_ROOT,
     months = sorted(set().union(*(set(info[nm]["months"]) for nm in var_names)))
     times = build_times(months)
     nt = len(times)
-    tvals = ((times - pd.Timestamp(f"{PLACEHOLDER_YEAR}-01-01"))
-             // pd.Timedelta("1h")).values.astype("int64")
+    tvals = _time_values(times)
 
     ct_req, cla, clo = chunks
     ct = min(ct_req, nt)
@@ -658,117 +974,39 @@ def convert(out_path, var_names=None, rad_var=None, root=DEFAULT_ROOT,
                                               "variables": v}
                              for k, v in grids.items()}
 
-    arrays, src_vars, deaccum_by_var = {}, {}, {}
+    made = {}
     for (nla, nlo), members in grids.items():
         grp = zroot if single_grid else zroot.create_group(group_name(nla, nlo))
-        lats = info_lats[(nla, nlo)]
-        lons = info[members[0]]["lons"]
-
-        # fill_value=None on coords is essential: zarr v2 defaults it to
-        # 0 and xarray then reads 0 as missing - which would silently
-        # NaN out lon=0.0 (the prime meridian IS on this grid) and time
-        # index 0.
-        zlat = _make_array(grp, "lat", (nla,), (nla,), "float32",
-                           fill_value=None)
-        zlat[:] = lats
-        zlat.attrs["_ARRAY_DIMENSIONS"] = ["lat"]
-        zlat.attrs["units"] = "degrees_north"
-
-        zlon = _make_array(grp, "lon", (nlo,), (nlo,), "float32",
-                           fill_value=None)
-        zlon[:] = lons
-        zlon.attrs["_ARRAY_DIMENSIONS"] = ["lon"]
-        zlon.attrs["units"] = "degrees_east"
-
-        ztime = _make_array(grp, "time", (nt,), (nt,), "int64",
-                            fill_value=None)
-        ztime[:] = tvals
-        ztime.attrs["_ARRAY_DIMENSIONS"] = ["time"]
-        ztime.attrs["units"] = (
-            f"hours since {PLACEHOLDER_YEAR}-01-01 00:00:00")
-        ztime.attrs["calendar"] = "standard"
-        grp.attrs["chunking_rationale"] = (
-            f"chunked ({ct},{cla},{clo}) so a point timeseries costs "
-            f"{int(np.ceil(nt/ct))} request(s) instead of {nt}")
-
+        _write_group_coords(grp, info_lats[(nla, nlo)],
+                            info[members[0]]["lons"], tvals, (ct, cla, clo))
         for nm in members:
             spec = specs[nm]
-            with open_source(root, fs, spec, info[nm]["sample_ts"]) as ds:
-                latn, lonn = find_coord_names(ds)
-                sv = pick_variable(ds, spec, latn, lonn)
-                src_units = ds[sv].attrs.get("units")
-                src_long = ds[sv].attrs.get("long_name")
-            src_vars[nm] = sv
+            sv, src_units, src_long = _resolve_source_var(
+                root, fs, spec, info[nm]["sample_ts"])
+            a, dsec = _define_array(
+                grp, nm, spec, root, sv, src_units, src_long,
+                (nt, nla, nlo), (ct, cla, clo), compressor, deaccumulate,
+                meta.get(nm), verbose)
+            made[nm] = (a, sv, dsec)
 
-            deaccum_seconds = (infer_deaccum_seconds(sv, src_units)
-                               if deaccumulate else None)
-            out_units = spec.units or src_units or ""
-            if deaccum_seconds:
-                out_units = "W m-2"
-                if verbose:
-                    print(f"  {nm} <- '{sv}' (units: {src_units}) "
-                          f"** ACCUMULATED FLUX DETECTED: dividing by "
-                          f"{deaccum_seconds}s -> stored as W m-2 **")
-            elif verbose:
-                print(f"  {nm} <- '{sv}' (units: {src_units})")
-
-            a = _make_array(grp, nm, (nt, nla, nlo), (ct, cla, clo),
-                            "float32", compressor=compressor,
-                            fill_value=np.nan)
-            a.attrs["_ARRAY_DIMENSIONS"] = ["time", "lat", "lon"]
-            a.attrs["units"] = out_units
-            a.attrs["long_name"] = spec.long_name or src_long or nm
-            a.attrs["source_variable"] = sv
-            a.attrs["source_units"] = src_units or ""
-            a.attrs["source_layout"] = f"{root}/{spec.path(1, 1, 0)}"
-            a.attrs["grid"] = f"{nla}x{nlo}"
-            if deaccum_seconds:
-                a.attrs["deaccumulated"] = True
-                a.attrs["deaccumulation_seconds"] = deaccum_seconds
-                a.attrs["note"] = (
-                    (spec.note + " " if spec.note else "") +
-                    f"Converted from accumulated '{src_units}' to average "
-                    f"W m-2 by dividing by {deaccum_seconds}s. Set "
-                    f"deaccumulate=False to store raw accumulated values.")
-            elif spec.note:
-                a.attrs["note"] = spec.note
-            arrays[nm] = a
-            deaccum_by_var[nm] = deaccum_seconds
-
-    missing = {nm: 0 for nm in var_names}
-    for start in range(0, nt, ct):
-        stop = min(start + ct, nt)
-        block = times[start:stop]
-        for nm in var_names:
-            spec, sv = specs[nm], src_vars[nm]
-            nla, nlo = info[nm]["nlat"], info[nm]["nlon"]
-            buf = np.full((stop - start, nla, nlo), np.nan, dtype="float32")
-            with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = {ex.submit(_fetch, root, fs, spec, sv, ts): i
-                        for i, ts in enumerate(block)}
-                for fut in cf.as_completed(futs):
-                    i = futs[fut]
-                    field = fut.result()
-                    if field is None:
-                        missing[nm] += 1
-                    else:
-                        buf[i] = field
-            if deaccum_by_var.get(nm):
-                buf = buf / deaccum_by_var[nm]
-            if quantize_digits is not None:
-                buf = np.round(buf, quantize_digits)
-            arrays[nm][start:stop, :, :] = buf
-        if verbose:
-            print(f"  wrote {stop}/{nt} timesteps ({100*stop/nt:.0f}%)")
+    stats_by_var = {}
+    for nm in var_names:
+        a, sv, dsec = made[nm]
+        stats = _fill_array(a, root, fs, specs[nm], sv, times, dsec,
+                            quantize_digits, max_workers, verbose, nm)
+        _record_coverage(a, nt, stats)
+        stats_by_var[nm] = stats
 
     zarr.consolidate_metadata(out_path)   # 1 metadata GET, not thousands
 
     if verbose:
         print(f"\nDone -> {out_path}")
         for nm in var_names:
-            tag = (f" (deaccumulated /{deaccum_by_var[nm]}s -> W m-2)"
-                   if deaccum_by_var.get(nm) else "")
-            print(f"  {nm}: {missing[nm]} missing/unreadable hours{tag}")
+            dsec = made[nm][2]
+            tag = f" (deaccumulated /{dsec}s -> W m-2)" if dsec else ""
+            st = stats_by_var[nm]
+            print(f"  {nm}: {st['missing']} missing/unreadable hours, "
+                  f"months with data {st['months_with_data']}{tag}")
         if not single_grid:
             print("\nRead with:")
             for (nla, nlo), members in grids.items():
@@ -777,7 +1015,474 @@ def convert(out_path, var_names=None, rad_var=None, root=DEFAULT_ROOT,
     return out_path
 
 
+# ---------------------------------------------------------------------
+# Adding to / annotating an existing store
+# ---------------------------------------------------------------------
+
+def _open_for_append(path):
+    """
+    Open an existing store read-write. zarr 3 would otherwise trust the
+    consolidated metadata, which goes stale the moment an array is
+    added; it is regenerated at the end of every append.
+    """
+    if ZARR2:
+        return zarr.open_group(path, mode="r+")
+    return zarr.open_group(path, mode="r+", use_consolidated=False)
+
+
+def _read_store_times(zroot, groups):
+    """The store's own time axis is the authority; refuse one we didn't make."""
+    first = next(iter(groups))
+    tv = np.asarray(zroot[first]["time"][:], dtype="int64")
+    times = pd.DatetimeIndex(pd.Timestamp(f"{PLACEHOLDER_YEAR}-01-01")
+                             + pd.to_timedelta(tv, unit="h"))
+    store_months = sorted(set(int(m) for m in times.month))
+    if not times.equals(build_times(store_months)):
+        raise RuntimeError(
+            "the store's time axis is not the standard hourly axis for its "
+            "months; refusing to modify a store whose axis this tool did "
+            "not make")
+    return times, store_months
+
+
+def _store_zarr_format(zroot):
+    return getattr(getattr(zroot, "metadata", None), "zarr_format", 2)
+
+
+def _adoptable(arr, sv, shape, deaccumulate):
+    """
+    Is this unregistered array a COMPLETE result of an earlier interrupted
+    run that matches what is being asked for now? months_with_data is
+    written only after a variable's last block has been stored, so its
+    presence is the completion marker; a half-written array lacks it.
+    """
+    a = arr.attrs
+    return ("months_with_data" in a
+            and a.get("source_variable") == sv
+            and tuple(arr.shape) == tuple(shape)
+            and bool(a.get("deaccumulate_option")) == bool(deaccumulate))
+
+
+def append(out_path, var_names, root=DEFAULT_ROOT, rad_var=None, replace=(),
+           meta=None, chunks=DEFAULT_CHUNKS, max_workers=16, clevel=5,
+           quantize_digits=None, deaccumulate=True, resume=False,
+           verbose=True):
+    """
+    Add variables to an EXISTING store without touching what is in it.
+
+    Nothing already in the store is rewritten. Each new variable is
+    placed in the existing group whose lat/lon it matches exactly, or in
+    a new group if none does (never regridded). It must fit the store's
+    time axis: months in the source that the store does not have are
+    refused rather than silently dropped, while months the store has but
+    the source lacks are left NaN and recorded in months_with_data.
+
+    replace : names of variables that may be overwritten. Anything else
+        already in the store is refused, so a repeated run cannot clobber
+        data.
+
+    The root attribute 'groups' and the consolidated metadata are only
+    updated once every new variable has been written, so an interrupted
+    run leaves unregistered (invisible) arrays rather than a store that
+    advertises variables it does not fully contain. (Variables being
+    replaced are un-registered first, before their data is deleted.)
+
+    Re-running after such an interruption: unregistered leftovers of the
+    variables being added are deleted and rewritten (they were never part
+    of the store). With resume=True, a leftover that was written
+    completely and matches the request (same source variable, shape and
+    deaccumulation option) is kept instead of re-read; a half-written one
+    is always deleted.
+    """
+    if not var_names:
+        raise ValueError("append() needs an explicit list of variables")
+    specs = build_specs(rad_var)
+    unknown = [v for v in var_names if v not in specs]
+    if unknown:
+        raise ValueError(f"unknown variable(s) {unknown}; known: {sorted(specs)}")
+    meta = meta or {}
+    fs = make_fs(root)
+
+    zroot = _open_for_append(out_path)
+    raw_groups = dict(zroot.attrs.get("groups") or {})
+    if not raw_groups:
+        raise RuntimeError(
+            f"{out_path} has no 'groups' attribute, so it is not a grouped "
+            f"store this tool can append to.")
+    groups = {g: {"shape": list(m["shape"]), "variables": list(m["variables"])}
+              for g, m in raw_groups.items()}
+    existing = {v: g for g, m in groups.items() for v in m["variables"]}
+
+    clash = [v for v in var_names if v in existing and v not in replace]
+    if clash:
+        raise RuntimeError(
+            f"already in the store: {clash}. Nothing was changed. Pass "
+            f"--replace {' '.join(clash)} to overwrite deliberately.")
+
+    times, store_months = _read_store_times(zroot, groups)
+    nt = len(times)
+    tvals = _time_values(times)
+
+    if verbose:
+        print(f"Appending to {out_path}")
+        print(f"  existing groups: "
+              f"{ {g: m['variables'] for g, m in groups.items()} }")
+        print(f"  time axis: {nt} steps, months {store_months}")
+        print(f"Reading from: {root} ({'HTTP' if fs else 'local filesystem'})")
+
+    info = {nm: inspect(root, specs[nm], fs) for nm in var_names}
+    for nm in var_names:
+        extra = sorted(set(info[nm]["months"]) - set(store_months))
+        if extra:
+            raise RuntimeError(
+                f"{nm}: source has month(s) {extra} that are not on the "
+                f"store's time axis {store_months}. Nothing was changed. "
+                f"Adding them would need a rebuild with a wider axis.")
+        lack = sorted(set(store_months) - set(info[nm]["months"]))
+        if verbose:
+            print(f"  {nm}: grid {info[nm]['nlat']}x{info[nm]['nlon']}, "
+                  f"source months {info[nm]['months']}"
+                  + (f"  -> months {lack} will be NaN" if lack else ""))
+
+    def match_group(nm):
+        la, lo = info[nm]["lats"], info[nm]["lons"]
+        for g in groups:
+            glat = np.asarray(zroot[g]["lat"][:], dtype="float64")
+            glon = np.asarray(zroot[g]["lon"][:], dtype="float64")
+            if (len(glat) == len(la) and len(glon) == len(lo)
+                    and np.allclose(glat, la, atol=1e-3)
+                    and np.allclose(glon, lo, atol=1e-3)):
+                return g
+        return None
+
+    plan, pending = {}, []      # pending: new groups to create
+    for nm in var_names:
+        g = match_group(nm)
+        if g is None:
+            la, lo = info[nm]["lats"], info[nm]["lons"]
+            for pg in pending:
+                if (len(pg["lats"]) == len(la) and len(pg["lons"]) == len(lo)
+                        and np.allclose(pg["lats"], la, atol=1e-3)
+                        and np.allclose(pg["lons"], lo, atol=1e-3)):
+                    g = pg["name"]
+                    break
+        if g is None:
+            la, lo = info[nm]["lats"], info[nm]["lons"]
+            base = _grid_group_name(la)
+            taken = set(groups) | {pg["name"] for pg in pending}
+            # Same spacing but different shape/domain must not collide
+            # with (or silently reuse) an existing group of that name.
+            name = base if base not in taken else f"{base}_{len(la)}x{len(lo)}"
+            pending.append({"name": name, "lats": la, "lons": lo})
+            g = name
+        plan[nm] = g
+
+    compressor = _make_compressor(clevel, _store_zarr_format(zroot))
+
+    # Deliberate overwrites. ORDER MATTERS: stop advertising the variable
+    # first, then delete its data, then refresh the consolidated metadata.
+    # Deleting first (as an earlier version did) meant an interruption
+    # during the long rewrite left the store listing a variable whose data
+    # was half destroyed. This way an interruption leaves the variable
+    # simply absent, which a re-run restores. The variable is therefore
+    # unavailable to readers while it is being rewritten.
+    replaced = [nm for nm in var_names if nm in existing]
+    if replaced:
+        for nm in replaced:
+            groups[existing[nm]]["variables"].remove(nm)
+        zroot.attrs["groups"] = groups            # 1. no longer advertised
+        for nm in replaced:
+            del zroot[existing[nm]][nm]           # 2. now remove the data
+        zarr.consolidate_metadata(out_path)       # 3. readers stop seeing it
+        if verbose:
+            for nm in replaced:
+                print(f"  {nm}: existing array removed (--replace); absent "
+                      f"from the store until the rewrite completes")
+
+    for pg in pending:
+        if pg["name"] in zroot:            # unregistered group from a crashed run
+            del zroot[pg["name"]]
+            if verbose:
+                print(f"  group {pg['name']}: removing unregistered leftover "
+                      f"from an interrupted run")
+        grp = zroot.create_group(pg["name"])
+        ct = min(chunks[0], nt)
+        _write_group_coords(grp, pg["lats"], pg["lons"], tvals,
+                            (ct, chunks[1], chunks[2]))
+        groups[pg["name"]] = {"shape": [nt, len(pg["lats"]), len(pg["lons"])],
+                              "variables": []}
+        if verbose:
+            print(f"  new group {pg['name']} "
+                  f"({len(pg['lats'])}x{len(pg['lons'])})")
+
+    def chunks_for(g):
+        for v in groups[g]["variables"]:
+            try:
+                return tuple(int(c) for c in zroot[g][v].chunks)
+            except Exception:
+                pass
+        return (min(chunks[0], nt), chunks[1], chunks[2])
+
+    results = {}
+    for nm in var_names:
+        g = plan[nm]
+        grp = zroot[g]
+        spec = specs[nm]
+        nla, nlo = info[nm]["nlat"], info[nm]["nlon"]
+        ch = chunks_for(g)
+        sv, src_units, src_long = _resolve_source_var(
+            root, fs, spec, info[nm]["sample_ts"])
+
+        # An array on disk that the registry does not list was left by an
+        # interrupted run (a registered one was refused or replaced above).
+        if nm in set(grp.array_keys()) and nm not in groups[g]["variables"]:
+            if resume and _adoptable(grp[nm], sv, (nt, nla, nlo), deaccumulate):
+                arr = grp[nm]
+                _apply_meta(arr, meta.get(nm))
+                groups[g]["variables"].append(nm)
+                dsec = (arr.attrs.get("deaccumulation_seconds")
+                        if arr.attrs.get("deaccumulated") else None)
+                results[nm] = (g, {
+                    "missing": int(arr.attrs["missing_hours"]),
+                    "months_with_data": list(arr.attrs["months_with_data"])},
+                    dsec)
+                if verbose:
+                    print(f"  {nm}: keeping the complete array an interrupted "
+                          f"run wrote (--resume); not re-reading it")
+                continue
+            del grp[nm]
+            if verbose:
+                print(f"  {nm}: removing unregistered leftover from an "
+                      f"interrupted run; rewriting it")
+
+        a, dsec = _define_array(
+            grp, nm, spec, root, sv, src_units, src_long, (nt, nla, nlo), ch,
+            compressor, deaccumulate, meta.get(nm), verbose)
+        if verbose:
+            print(f"  {nm} -> group {g}, chunks {ch}")
+        stats = _fill_array(a, root, fs, spec, sv, times, dsec,
+                            quantize_digits, max_workers, verbose, nm)
+        _record_coverage(a, nt, stats)
+        groups[g]["variables"].append(nm)
+        results[nm] = (g, stats, dsec)
+
+    zroot.attrs["groups"] = groups              # register only when complete
+    zarr.consolidate_metadata(out_path)
+
+    if verbose:
+        print(f"\nDone. Appended to {out_path}")
+        for nm, (g, st, dsec) in results.items():
+            tag = f" (deaccumulated /{dsec}s)" if dsec else ""
+            print(f"  {nm} in {g}: {st['missing']} missing hours, "
+                  f"months with data {st['months_with_data']}{tag}")
+    return results
+
+
+def fill(out_path, var_names, root=DEFAULT_ROOT, rad_var=None, months=None,
+         max_workers=16, quantize_digits=None, verbose=True):
+    """
+    Write months that were NaN because their source files had not arrived,
+    now that they have - without touching anything else.
+
+    For each variable, the months to fill are those whose source files now
+    exist and that the array's months_with_data attribute does not list
+    (or exactly `months`, if given). Only those hours are read and written,
+    in place. Nothing is deleted, so the array is valid at every moment:
+    an interruption leaves it with the months it had, and re-running
+    fills the rest. months_with_data is updated only after a month is
+    written, and a month not listed there has no data in the store, so
+    overwriting its whole slice can never destroy anything.
+
+    Each month is checked against what the array already holds before
+    it is written: the source variable's units must equal the recorded
+    source_units, and the grid must equal the group's. A later delivery
+    that quietly changed either is refused, not stored.
+    """
+    if not var_names:
+        raise ValueError("fill() needs an explicit list of variables")
+    specs = build_specs(rad_var)
+    fs = make_fs(root)
+    zroot = _open_for_append(out_path)
+    groups = dict(zroot.attrs.get("groups") or {})
+    if not groups:
+        raise RuntimeError(f"{out_path} has no 'groups' attribute")
+    where = {v: g for g, m in groups.items() for v in m["variables"]}
+    absent = [v for v in var_names if v not in where]
+    if absent:
+        raise RuntimeError(f"not in the store: {absent}. Use --append to add "
+                           f"a variable; --fill only completes existing ones.")
+    times, store_months = _read_store_times(zroot, groups)
+    month_of = np.asarray(times.month)
+
+    summary = {}
+    for nm in var_names:
+        spec = specs[nm]
+        g = where[nm]
+        arr = zroot[g][nm]
+        have = arr.attrs.get("months_with_data")
+        if have is None and months is None:
+            raise RuntimeError(
+                f"{nm} has no months_with_data attribute (it predates it), so "
+                f"which months are empty is not recorded. Pass --months "
+                f"explicitly for months you know are empty.")
+        have = set(int(m) for m in (have or []))
+        info = inspect(root, spec, fs)
+        src_months = set(info["months"])
+
+        if months is None:
+            todo = sorted((src_months & set(store_months)) - have)
+        else:
+            todo = sorted(set(int(m) for m in months))
+            bad = [m for m in todo if m not in store_months or m not in src_months]
+            if bad:
+                raise RuntimeError(
+                    f"{nm}: month(s) {bad} are not both on the store's time "
+                    f"axis {store_months} and present in the source "
+                    f"{sorted(src_months)}")
+            held = [m for m in todo if m in have]
+            if held:
+                raise RuntimeError(
+                    f"{nm}: month(s) {held} already have data. --fill only "
+                    f"completes empty months; to refresh data use --replace.")
+        if not todo:
+            if verbose:
+                print(f"  {nm}: nothing to fill (months with data "
+                      f"{sorted(have)}; source months {sorted(src_months)})")
+            summary[nm] = []
+            continue
+
+        sv = arr.attrs["source_variable"]
+        want_units = arr.attrs.get("source_units", "")
+        dsec = (arr.attrs.get("deaccumulation_seconds")
+                if arr.attrs.get("deaccumulated") else None)
+        glat = np.asarray(zroot[g]["lat"][:], dtype="float64")
+        glon = np.asarray(zroot[g]["lon"][:], dtype="float64")
+        nla, nlo = arr.shape[1], arr.shape[2]
+
+        written, total_read = [], 0
+        for m in todo:
+            idx = np.flatnonzero(month_of == m)
+            i0, i1 = int(idx[0]), int(idx[-1]) + 1
+            if i1 - i0 != len(idx):
+                raise RuntimeError(f"month {m} is not contiguous on the time axis")
+            block = times[i0:i1]
+
+            # Guard: a month delivered later must match what is stored.
+            sample = None
+            for ts in block:
+                try:
+                    with open_source(root, fs, spec, ts) as ds:
+                        latn, lonn = find_coord_names(ds)
+                        got_units = ds[sv].attrs.get("units") or ""
+                        la = np.asarray(ds[latn].values, dtype="float64")
+                        lo = np.asarray(ds[lonn].values, dtype="float64")
+                    sample = ts
+                    break
+                except Exception:
+                    continue
+            if sample is None:
+                if verbose:
+                    print(f"  {nm}: month {m:02d}: no readable file, skipped")
+                continue
+            if got_units != want_units:
+                raise RuntimeError(
+                    f"{nm}: month {m:02d} files declare units {got_units!r} but "
+                    f"the stored data came from units {want_units!r}. Refusing "
+                    f"to mix them. Nothing from this month was written.")
+            if (la.shape != glat.shape or lo.shape != glon.shape
+                    or not np.allclose(la, glat, atol=1e-3)
+                    or not np.allclose(lo, glon, atol=1e-3)):
+                raise RuntimeError(
+                    f"{nm}: month {m:02d} files are on a different grid from "
+                    f"the stored data. Nothing from this month was written.")
+
+            buf = np.full((i1 - i0, nla, nlo), np.nan, dtype="float32")
+            n_ok = 0
+            with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = {ex.submit(_fetch, root, fs, spec, sv, ts): i
+                        for i, ts in enumerate(block)}
+                for fut in cf.as_completed(futs):
+                    field = fut.result()
+                    if field is not None:
+                        buf[futs[fut]] = field
+                        n_ok += 1
+            if n_ok == 0:
+                if verbose:
+                    print(f"  {nm}: month {m:02d}: no readable hours, skipped")
+                continue
+            if dsec:
+                buf = buf / dsec
+            if quantize_digits is not None:
+                buf = np.round(buf, quantize_digits)
+            arr[i0:i1, :, :] = buf           # whole month was empty: safe
+            written.append(m)
+            total_read += n_ok
+            if verbose:
+                print(f"  {nm}: month {m:02d}: wrote {n_ok}/{i1 - i0} hours")
+
+        if written:
+            arr.attrs["months_with_data"] = sorted(have | set(written))
+            old_missing = arr.attrs.get("missing_hours")
+            if old_missing is not None:
+                arr.attrs["missing_hours"] = max(0, int(old_missing) - total_read)
+        summary[nm] = written
+        # Refresh after every variable, not only at the end, so the
+        # published metadata never lags far behind the data if a later
+        # variable is interrupted.
+        zarr.consolidate_metadata(out_path)
+
+    if verbose:
+        print(f"\nDone. Filled: {summary}")
+    return summary
+
+
+def annotate(out_path, meta, verbose=True):
+    """
+    Change attributes on arrays in an existing store, writing no data.
+    Used e.g. to record units once they have been established.
+    """
+    if not meta:
+        raise ValueError("nothing to annotate")
+    zroot = _open_for_append(out_path)
+    groups = dict(zroot.attrs.get("groups") or {})
+    where = {v: g for g, m in groups.items() for v in m["variables"]}
+    missing = [v for v in meta if v not in where]
+    if missing:
+        raise RuntimeError(f"not in the store: {missing}; have {sorted(where)}")
+    for nm, attrs in meta.items():
+        arr = zroot[where[nm]][nm]
+        _apply_meta(arr, attrs)
+        if verbose:
+            for k, v in attrs.items():
+                print(f"  {nm}.{k} = {v!r}")
+    zarr.consolidate_metadata(out_path)
+    if verbose:
+        print("metadata re-consolidated")
+
+
+def parse_meta(items, valid):
+    """['WCT.units=degF', ...] -> {'WCT': {'units': 'degF'}}"""
+    out = {}
+    for it in items or []:
+        key, sep, val = it.partition("=")
+        var, dot, attr = key.partition(".")
+        if not (sep and dot and var and attr):
+            raise SystemExit(f"--meta expects VAR.attr=value, got {it!r}")
+        if var not in valid:
+            raise SystemExit(f"--meta: unknown variable {var!r}; "
+                             f"known: {sorted(valid)}")
+        out.setdefault(var, {})[attr] = val
+    return out
+
+
 def main():
+    # A crash inside a C library (netCDF-C, HDF5, blosc) is not a Python
+    # exception and normally leaves only "Segmentation fault (core
+    # dumped)". faulthandler prints every thread's Python stack at that
+    # moment, which shows which function and file it died in.
+    import faulthandler
+    faulthandler.enable()
+    known = sorted(build_specs())
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -786,8 +1491,33 @@ def main():
                    help=f"source root: local path or http(s) URL "
                         f"(default: {DEFAULT_ROOT})")
     p.add_argument("--vars", nargs="*", default=None,
-                   choices=["2T", "SSRD", "WS10"],
-                   help="variables to include (default: all three)")
+                   choices=known + ["all"],
+                   help=f"variables to include. Build default: "
+                        f"{' '.join(CORE_VARS)}. 'all' = every known "
+                        f"variable. Required with --append.")
+    p.add_argument("--append", action="store_true",
+                   help="add --vars to the EXISTING store at --out instead "
+                        "of building one (existing data is not touched)")
+    p.add_argument("--replace", nargs="*", default=[], choices=known,
+                   help="with --append: variables allowed to be overwritten")
+    p.add_argument("--fill", action="store_true",
+                   help="complete existing variables with months whose source "
+                        "files have arrived since (writes only those months; "
+                        "deletes nothing)")
+    p.add_argument("--months", type=int, nargs="*", default=None,
+                   help="with --fill: fill exactly these months instead of "
+                        "detecting them")
+    p.add_argument("--resume", action="store_true",
+                   help="with --append: after an interrupted run, keep "
+                        "variables it wrote completely instead of re-reading "
+                        "them (half-written ones are always redone)")
+    p.add_argument("--annotate", action="store_true",
+                   help="only change array attributes in the existing store "
+                        "(via --meta); writes no data")
+    p.add_argument("--meta", action="append", default=[],
+                   metavar="VAR.attr=value",
+                   help="set an array attribute, e.g. WCT.units=degF; "
+                        "repeatable")
     p.add_argument("--rad-var", default=None,
                    help="exact surface-solar variable name inside the rad "
                         "files; omit to auto-detect")
@@ -806,16 +1536,54 @@ def main():
                         "raw, without converting J m-2 -> W m-2")
     a = p.parse_args()
 
+    names = None
+    if a.vars:
+        names = known if "all" in a.vars else a.vars
+    meta = parse_meta(a.meta, set(known))
+
     if a.list_vars:
-        list_vars(a.vars, a.rad_var, root=a.root)
+        list_vars(names, a.rad_var, root=a.root)
         return
     if not a.out:
         p.error("--out is required (or use --list-vars)")
 
-    convert(a.out, var_names=a.vars, rad_var=a.rad_var, root=a.root,
+    if a.annotate:
+        if not meta:
+            p.error("--annotate needs at least one --meta VAR.attr=value")
+        annotate(a.out, meta)
+        return
+
+    if a.fill:
+        if a.append:
+            p.error("--fill and --append are different operations; use one")
+        if not names:
+            p.error("--fill needs an explicit --vars list")
+        fill(a.out, names, root=a.root, rad_var=a.rad_var, months=a.months,
+             max_workers=a.max_workers, quantize_digits=a.quantize_digits)
+        return
+
+    if a.append:
+        if not names:
+            p.error("--append needs an explicit --vars list (it will not "
+                    "guess which variables to add)")
+        append(a.out, names, root=a.root, rad_var=a.rad_var,
+               replace=tuple(a.replace), meta=meta, chunks=tuple(a.chunks),
+               max_workers=a.max_workers, clevel=a.clevel,
+               quantize_digits=a.quantize_digits,
+               deaccumulate=not a.no_deaccumulate, resume=a.resume)
+        return
+
+    if a.replace:
+        p.error("--replace only applies with --append")
+    if a.resume:
+        p.error("--resume only applies with --append")
+    if a.months:
+        p.error("--months only applies with --fill")
+    convert(a.out, var_names=names, rad_var=a.rad_var, root=a.root,
             chunks=tuple(a.chunks), max_workers=a.max_workers,
             clevel=a.clevel, quantize_digits=a.quantize_digits,
-            zarr_format=a.zarr_format, deaccumulate=not a.no_deaccumulate)
+            zarr_format=a.zarr_format, deaccumulate=not a.no_deaccumulate,
+            meta=meta)
 
 
 if __name__ == "__main__":

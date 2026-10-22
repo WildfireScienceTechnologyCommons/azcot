@@ -78,7 +78,17 @@ def discover_var_groups(zarr_path):
 
 
 def _open_group(zarr_path, group):
-    return xr.open_zarr(zarr_path, group=group) if group else xr.open_zarr(zarr_path)
+    try:
+        return (xr.open_zarr(zarr_path, group=group) if group
+                else xr.open_zarr(zarr_path))
+    except TypeError as exc:
+        if "zarr_format" in str(exc):
+            raise RuntimeError(
+                "this xarray passes a zarr-3-only argument to zarr "
+                f"{zarr.__version__}. Either install an older xarray "
+                "(2026.7.0 was tested working with zarr 2.18) or move to "
+                "zarr>=3.") from exc
+        raise
 
 
 def _decode_time(t64):
@@ -360,7 +370,7 @@ def main():
                         "un-converted accumulated variable is expected "
                         "rather than a fault")
     p.add_argument("--vars", nargs="*", default=None,
-                   choices=["2T", "SSRD", "WS10"])
+                   choices=sorted(build_specs()))
     a = p.parse_args()
 
     specs = build_specs(a.rad_var)

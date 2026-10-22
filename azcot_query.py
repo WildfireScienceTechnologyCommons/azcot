@@ -182,6 +182,14 @@ class AzcotStore:
             kw["group"] = group
         try:
             return xr.open_zarr(self._store, **kw)
+        except TypeError as exc:
+            if "zarr_format" in str(exc):
+                raise RuntimeError(
+                    "this xarray passes a zarr-3-only argument to zarr "
+                    f"{zarr.__version__}. Either install an older xarray "
+                    "(2026.7.0 was tested working with zarr 2.18) or move "
+                    "to zarr>=3.") from exc
+            raise
         except Exception as exc:
             if self._consolidated:
                 raise RuntimeError(
@@ -270,24 +278,45 @@ class AzcotStore:
             return int(m.group(1)) * 3600
         return None
 
+    def _store_months(self):
+        t = self._groups[self._var_groups[self.variables[0]]].time
+        return sorted(int(m) for m in pd.DatetimeIndex(t.values).month.unique())
+
+    def months_with_data(self, var):
+        """
+        Months for which this variable has any data, from the attribute
+        recorded when the store was built; None for older stores that
+        pre-date it (coverage then unknown, not assumed complete).
+        """
+        m = self._da(var).attrs.get("months_with_data")
+        return None if m is None else [int(x) for x in m]
+
     def summary(self):
         """Human-readable description of what's in the store."""
         lines = [f"Store: {self.path}"]
+        store_months = self._store_months()
         for v in self.variables:
             da = self._da(v)
             g = self._var_groups[v]
             secs = self._accum_seconds(v)
-            note = ""
+            notes = []
             if secs:
-                note = (f"  [stored accumulated over {secs//3600}h; "
-                        f"si=True divides by {secs} -> W m-2]")
+                notes.append(f"stored accumulated over {secs//3600}h; "
+                             f"si=True divides by {secs} -> W m-2")
+            units = da.attrs.get("units") or "<unspecified>"
+            if not da.attrs.get("units") and da.attrs.get("units_note"):
+                notes.append("source files declare no units")
+            have = self.months_with_data(v)
+            if have is not None and have != store_months:
+                lacking = [m for m in store_months if m not in have]
+                notes.append(f"NO DATA for month(s) {lacking}: NaN")
+            tail = f"  [{'; '.join(notes)}]" if notes else ""
             lines.append(
-                f"  {v:6s} group={g or '<root>':10s} "
+                f"  {v:6s} group={g or '<root>':15s} "
                 f"grid={da.sizes['lat']}x{da.sizes['lon']} "
-                f"units={da.attrs.get('units','?')}{note}")
-        t = self._groups[self._var_groups[self.variables[0]]].time
-        months = sorted(pd.DatetimeIndex(t.values).month.unique())
-        lines.append(f"  time: {len(t)} hourly steps, months {months} "
+                f"units={units}{tail}")
+        lines.append(f"  time: {len(self._groups[self._var_groups[self.variables[0]]].time)} "
+                     f"hourly steps, months {store_months} "
                      f"(year is a placeholder and carries no meaning)")
         return "\n".join(lines)
 
@@ -374,6 +403,22 @@ class AzcotStore:
         # time ops (resample, rolling) keep working on a monotonic
         # index; plotting reorders for display only, using this flag
         # plus the start month.
+        # Per-variable months with no source data inside the selected
+        # window. A variable that is missing one month looks like a valid
+        # series with a hole, so say so rather than leave it to be found.
+        sel_months = sorted(set(int(m) for m in df.index.month))
+        gaps = {}
+        for v in variables:
+            have = self.months_with_data(v)
+            if have is not None:
+                lacking = [m for m in sel_months if m not in have]
+                if lacking:
+                    gaps[v] = lacking
+        df.attrs["months_missing"] = gaps
+        if warn:
+            for v, lacking in gaps.items():
+                print(f"NOTE: {v} has no source data for month(s) {lacking} "
+                      f"(not delivered in the archive); those rows are NaN.")
         df.attrs["wrapped"] = wrapped
         df.attrs["wrap_start_month"] = (parse_mmddhh(start).month
                                         if wrapped else None)
@@ -570,7 +615,7 @@ def plot_timeseries(df, variables=None, title=None, compress_gaps="auto",
         axes = [axes]
     for ax, v in zip(axes, variables):
         ax.plot(x, df[v].values, linewidth=0.7)
-        ax.set_ylabel(f"{v}\n({df.attrs['units'].get(v,'')})")
+        ax.set_ylabel(f"{v}\n({df.attrs['units'].get(v) or 'units unknown'})")
         ax.grid(alpha=0.3)
 
     _apply_month_ticks(axes[-1], index, compress)
